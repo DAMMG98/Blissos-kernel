@@ -1,0 +1,74 @@
+name: Build x86 Kernel with Wacom
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout (shallow)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git bc bison flex libssl-dev make gcc libncurses-dev cpio libelf-dev dwarves python3 rsync build-essential
+
+      - name: Clone android-x86 kernel repo
+        run: |
+          git clone https://android.googlesource.com/kernel/x86 kernel-x86
+          cd kernel-x86
+          git fetch --all
+
+      - name: Prepare build dir and default config
+        run: |
+          cd kernel-x86
+          export ARCH=x86
+          export KBUILD_OUTPUT=$(pwd)/out
+          mkdir -p "$KBUILD_OUTPUT"
+          make O="$KBUILD_OUTPUT" defconfig
+
+      - name: Enable Wacom options in .config
+        run: |
+          cd kernel-x86
+          export KBUILD_OUTPUT=$(pwd)/out
+          # ensure scripts/config is available
+          make O="$KBUILD_OUTPUT" scripts || true
+          # enable Wacom support
+          scripts/config --file "$KBUILD_OUTPUT/.config" --enable CONFIG_INPUT_WACOM || true
+          scripts/config --file "$KBUILD_OUTPUT/.config" --enable CONFIG_HID_WACOM || true
+          make O="$KBUILD_OUTPUT" olddefconfig
+
+      - name: Build bzImage and modules
+        run: |
+          cd kernel-x86
+          export ARCH=x86
+          export KBUILD_OUTPUT=$(pwd)/out
+          make -j$(nproc) O="$KBUILD_OUTPUT" bzImage || (tail -n 200 "$KBUILD_OUTPUT"/build.log || true; exit 1)
+          make -j$(nproc) O="$KBUILD_OUTPUT" modules
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp "$KBUILD_OUTPUT/arch/x86/boot/bzImage" "$GITHUB_WORKSPACE/artifacts/bzImage"
+
+      - name: Create simple initramfs (fallback)
+        run: |
+          mkdir -p tmp-initramfs/{bin,sbin,etc,proc,sys,newroot,dev}
+          if command -v busybox >/dev/null 2>&1; then
+            cp "$(which busybox)" tmp-initramfs/bin/
+          fi
+          (cd tmp-initramfs && find . | cpio -o -H newc | gzip > "$GITHUB_WORKSPACE/artifacts/initramfs.img")
+
+      - name: Package modules
+        run: |
+          cd kernel-x86
+          export KBUILD_OUTPUT=$(pwd)/out
+          rsync -a "$KBUILD_OUTPUT"/lib/modules "$GITHUB_WORKSPACE/artifacts/" || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-wacom-artifacts
+          path: artifacts
